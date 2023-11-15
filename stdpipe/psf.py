@@ -10,10 +10,33 @@ import numpy as np
 from astropy.io import fits
 from astropy.table import Table
 
+from scipy import ndimage
+
 from . import photometry
 from . import utils
 
-def run_psfex(image, mask=None, thresh=2.0, aper=3.0, r0=0.5, gain=1, minarea=5, vignet_size=None, order=0, sex_extra={}, checkimages=[], extra={}, psffile=None, _workdir=None, _tmpdir=None, _exe=None, _sex_exe=None, verbose=False):
+
+def run_psfex(
+    image,
+    mask=None,
+    thresh=2.0,
+    aper=None,
+    r0=0.0,
+    gain=1,
+    minarea=5,
+    vignet_size=None,
+    order=0,
+    sex_extra={},
+    checkimages=[],
+    extra={},
+    psffile=None,
+    get_obj=False,
+    _workdir=None,
+    _tmpdir=None,
+    _exe=None,
+    _sex_exe=None,
+    verbose=False,
+):
     """Wrapper around PSFEx to help extracting PSF models from images.
 
     For the details of PSFEx operation we suggest to consult its documentation at https://psfex.readthedocs.io
@@ -21,7 +44,7 @@ def run_psfex(image, mask=None, thresh=2.0, aper=3.0, r0=0.5, gain=1, minarea=5,
     :param image: Input image as a NumPy array
     :param mask: Image mask as a boolean array (True values will be masked), optional
     :param thresh: Detection threshold in sigmas above local background, for running initial SExtractor object detection
-    :param aper: Circular aperture radius in pixels, to be used for initial SExtractor object detection
+    :param aper: Circular aperture radius in pixels, to be used for PSF normalization. Should contain most of object flux. If not specified, will be estimated as twice the FWHM
     :param r0: Smoothing kernel size (sigma) to be used for improving object detection in initial SExtractor call
     :param gain: Image gain
     :param minarea: Minimal number of pixels in the object to be considered a detection (`DETECT_MINAREA` parameter of SExtractor)
@@ -31,6 +54,7 @@ def run_psfex(image, mask=None, thresh=2.0, aper=3.0, r0=0.5, gain=1, minarea=5,
     :param checkimages: List of PSFEx checkimages to return along with PSF model. Optional.
     :param extra: Dictionary of extra configuration parameters to be passed to PSFEx call, with keys as parameter names. See :code:`psfex -dd` for the full list.
     :param psffile: If specified, PSF model file will also be stored under this file name, so that it may e.g. be re-used by SExtractor later. Optional
+    :param get_obj: If set, also return the table with SExtractor detected objects.
     :param _workdir: If specified, all temporary files will be created in this directory, and will be kept intact after running SExtractor and PSFEx. May be used for debugging exact inputs and outputs of the executable. Optional
     :param _tmpdir: If specified, all temporary files will be created in a dedicated directory (that will be deleted after running the executable) inside this path.
     :param _exe: Full path to PSFEx executable. If not provided, the code tries to locate it automatically in your :envvar:`PATH`.
@@ -53,8 +77,12 @@ def run_psfex(image, mask=None, thresh=2.0, aper=3.0, r0=0.5, gain=1, minarea=5,
 
     """
 
-     # Simple wrapper around print for logging in verbose mode only
-    log = (verbose if callable(verbose) else print) if verbose else lambda *args,**kwargs: None
+    # Simple wrapper around print for logging in verbose mode only
+    log = (
+        (verbose if callable(verbose) else print)
+        if verbose
+        else lambda *args, **kwargs: None
+    )
 
     # Find the binary
     binname = None
@@ -76,15 +104,61 @@ def run_psfex(image, mask=None, thresh=2.0, aper=3.0, r0=0.5, gain=1, minarea=5,
     # else:
     #     log("Using PSFEx binary at", binname)
 
-    workdir = _workdir if _workdir is not None else tempfile.mkdtemp(prefix='psfex', dir=_tmpdir)
+    workdir = (
+        _workdir
+        if _workdir is not None
+        else tempfile.mkdtemp(prefix='psfex', dir=_tmpdir)
+    )
     psf = None
 
+    # Estimate image FWHM if aperture radius is not set
+    if not aper:
+        log('Aperture size not specified, will estimate it from image FWHM')
+        obj = photometry.get_objects_sextractor(
+            image,
+            mask=mask,
+            thresh=thresh,
+            aper=3.0,
+            r0=r0,
+            gain=gain,
+            minarea=minarea,
+            _workdir=workdir,
+            _tmpdir=_tmpdir,
+            _exe=_sex_exe,
+            verbose=verbose,
+            extra=sex_extra,
+        )
+        fwhm = np.median(obj['fwhm'][obj['flags'] == 0])
+        aper = 2.0*fwhm
+        log('FWHM = %.1f pixels, will use aperture radius %.1f pixels' % (fwhm, aper))
+
     if vignet_size is None:
-        vignet_size = 6*aper + 1
-        log('Extracting PSF using vignette size %d x %d pixels' % (vignet_size, vignet_size))
+        vignet_size = 6 * aper + 1
+        log(
+            'Extracting PSF using vignette size %d x %d pixels'
+            % (vignet_size, vignet_size)
+        )
 
     # Run SExtractor on input image in current workdir so that the LDAC catalogue will be in out.cat there
-    obj = photometry.get_objects_sextractor(image, mask=mask, thresh=thresh, aper=aper, r0=r0, gain=gain, minarea=minarea, _workdir=workdir, _tmpdir=_tmpdir, _exe=_sex_exe, verbose=verbose, extra_params=['SNR_WIN', 'ELONGATION', 'VIGNET(%d,%d)' % (vignet_size,vignet_size)], extra=sex_extra)
+    obj = photometry.get_objects_sextractor(
+        image,
+        mask=mask,
+        thresh=thresh,
+        aper=aper,
+        r0=r0,
+        gain=gain,
+        minarea=minarea,
+        _workdir=workdir,
+        _tmpdir=_tmpdir,
+        _exe=_sex_exe,
+        verbose=verbose,
+        extra_params=[
+            'SNR_WIN',
+            'ELONGATION',
+            'VIGNET(%d,%d)' % (vignet_size, vignet_size),
+        ],
+        extra=sex_extra,
+    )
 
     catname = os.path.join(workdir, 'out.cat')
     psfname = os.path.join(workdir, 'out.psf')
@@ -102,7 +176,9 @@ def run_psfex(image, mask=None, thresh=2.0, aper=3.0, r0=0.5, gain=1, minarea=5,
         'WRITE_XML': 'N',
     }
 
-    checknames = [os.path.join(workdir, _.replace('-', 'M_') + '.fits') for _ in checkimages]
+    checknames = [
+        os.path.join(workdir, _.replace('-', 'M_') + '.fits') for _ in checkimages
+    ]
     if checkimages:
         opts['CHECKIMAGE_TYPE'] = ','.join(checkimages)
         opts['CHECKIMAGE_NAME'] = ','.join(checknames)
@@ -110,7 +186,9 @@ def run_psfex(image, mask=None, thresh=2.0, aper=3.0, r0=0.5, gain=1, minarea=5,
     opts.update(extra)
 
     # Build the command line
-    cmd = binname + ' ' + shlex.quote(catname) + ' ' + utils.format_astromatic_opts(opts)
+    cmd = (
+        binname + ' ' + shlex.quote(catname) + ' ' + utils.format_astromatic_opts(opts)
+    )
     if not verbose:
         cmd += ' > /dev/null 2>/dev/null'
     log('Will run PSFEx like that:')
@@ -141,10 +219,17 @@ def run_psfex(image, mask=None, thresh=2.0, aper=3.0, r0=0.5, gain=1, minarea=5,
             checkname = os.path.splitext(name)[0] + '_out.fits'
             result.append(fits.getdata(checkname))
 
+    if get_obj:
+        if type(result) != list:
+            result = [result]
+
+        result.append(obj)
+
     if _workdir is None:
         shutil.rmtree(workdir)
 
     return result
+
 
 def load_psf(filename, get_header=False, verbose=False):
     """Load PSF model from PSFEx file
@@ -158,8 +243,12 @@ def load_psf(filename, get_header=False, verbose=False):
 
     """
 
-     # Simple wrapper around print for logging in verbose mode only
-    log = (verbose if callable(verbose) else print) if verbose else lambda *args,**kwargs: None
+    # Simple wrapper around print for logging in verbose mode only
+    log = (
+        (verbose if callable(verbose) else print)
+        if verbose
+        else lambda *args, **kwargs: None
+    )
 
     log('Loading PSF model from %s' % filename)
 
@@ -170,10 +259,8 @@ def load_psf(filename, get_header=False, verbose=False):
         'width': header.get('PSFAXIS1'),
         'height': header.get('PSFAXIS2'),
         'ncoeffs': header.get('PSFAXIS3'),
-
         'fwhm': header.get('PSF_FWHM'),
         'sampling': header.get('PSF_SAMP'),
-
         'degree': header.get('POLDEG1', 0),
         'x0': header.get('POLZERO1', 0),
         'sx': header.get('POLSCAL1', 1),
@@ -186,9 +273,13 @@ def load_psf(filename, get_header=False, verbose=False):
 
     psf['data'] = data[0][0]
 
-    log('PSF model %d x %d pixels, FWHM %.1f pixels, sampling %.2f, degree %d' % (psf['width'], psf['height'], psf['fwhm'], psf['sampling'], psf['degree']))
+    log(
+        'PSF model %d x %d pixels, FWHM %.1f pixels, sampling %.2f, degree %d'
+        % (psf['width'], psf['height'], psf['fwhm'], psf['sampling'], psf['degree'])
+    )
 
     return psf
+
 
 def bilinear_interpolate(im, x, y):
     """
@@ -203,10 +294,10 @@ def bilinear_interpolate(im, x, y):
     y0 = np.floor(y).astype(int)
     y1 = y0 + 1
 
-    x0 = np.clip(x0, 0, im.shape[1] - 1);
-    x1 = np.clip(x1, 0, im.shape[1] - 1);
-    y0 = np.clip(y0, 0, im.shape[0] - 1);
-    y1 = np.clip(y1, 0, im.shape[0] - 1);
+    x0 = np.clip(x0, 0, im.shape[1] - 1)
+    x1 = np.clip(x1, 0, im.shape[1] - 1)
+    y0 = np.clip(y0, 0, im.shape[0] - 1)
+    y1 = np.clip(y1, 0, im.shape[0] - 1)
 
     Ia = im[y0, x0]
     Ib = im[y1, x0]
@@ -218,7 +309,8 @@ def bilinear_interpolate(im, x, y):
     wc = (x - x0) * (y1 - y)
     wd = (x - x0) * (y - y0)
 
-    return wa*Ia + wb*Ib + wc*Ic + wd*Id
+    return wa * Ia + wb * Ib + wc * Ic + wd * Id
+
 
 def get_supersampled_psf_stamp(psf, x=0, y=0, normalize=True):
     """Returns supersampled PSF model for a given position inside the image.
@@ -235,21 +327,22 @@ def get_supersampled_psf_stamp(psf, x=0, y=0, normalize=True):
 
     """
 
-    dx = 1.0*(x - psf['x0'])/psf['sx']
-    dy = 1.0*(y - psf['y0'])/psf['sy']
+    dx = 1.0 * (x - psf['x0']) / psf['sx']
+    dy = 1.0 * (y - psf['y0']) / psf['sy']
 
     stamp = np.zeros(psf['data'].shape[1:], dtype=np.double)
     i = 0
 
     for i2 in range(0, psf['degree'] + 1):
         for i1 in range(0, psf['degree'] + 1 - i2):
-            stamp += psf['data'][i] * dx**i1 * dy**i2
+            stamp += psf['data'][i] * dx ** i1 * dy ** i2
             i += 1
 
     if normalize:
         stamp /= np.sum(stamp)
 
     return stamp
+
 
 def get_psf_stamp(psf, x=0, y=0, dx=None, dy=None, normalize=True):
     """Returns PSF stamp in original image pixel space with sub-pixel shift applied.
@@ -294,8 +387,8 @@ def get_psf_stamp(psf, x=0, y=0, dx=None, dy=None, normalize=True):
     ssy0 = np.floor(supersampled.shape[0] / 2)
 
     # Make odd-sized array to hold the result
-    x0 = np.floor(psf['width']*psf['sampling']/2)
-    y0 = np.floor(psf['height']*psf['sampling']/2)
+    x0 = np.floor(psf['width'] * psf['sampling'] / 2)
+    y0 = np.floor(psf['height'] * psf['sampling'] / 2)
 
     width = int(x0) * 2 + 1
     height = int(y0) * 2 + 1
@@ -307,16 +400,18 @@ def get_psf_stamp(psf, x=0, y=0, dx=None, dy=None, normalize=True):
     y, x = np.mgrid[0:height, 0:width]
 
     # The same grid in supersampled space, shifted accordingly
-    x1 = ssx0 + (x - x0)/psf['sampling']
-    y1 = ssy0 + (y - y0)/psf['sampling']
+    x1 = ssx0 + (x - x0) / psf['sampling']
+    y1 = ssy0 + (y - y0) / psf['sampling']
 
     # FIXME: it should really be Lanczos interpolation here!
-    stamp = bilinear_interpolate(supersampled, x1, y1)/psf['sampling']**2
+    # stamp = bilinear_interpolate(supersampled, x1, y1) / psf['sampling'] ** 2
+    stamp = ndimage.map_coordinates(supersampled, [y1, x1], order=3) / psf['sampling'] ** 2
 
     if normalize:
         stamp /= np.sum(stamp)
 
     return stamp
+
 
 def place_psf_stamp(image, psf, x0, y0, flux=1, gain=None):
     """Places PSF stamp, scaled to a given flux, at a given position inside the image.
@@ -345,15 +440,15 @@ def place_psf_stamp(image, psf, x0, y0, flux=1, gain=None):
     if gain is not None:
         idx = stamp > 0
         # FIXME: what to do with negative points?..
-        stamp[idx] = np.random.poisson(stamp[idx]*gain)/gain
+        stamp[idx] = np.random.poisson(stamp[idx] * gain) / gain
 
     # Integer coordinates inside the stamp
-    y,x = np.mgrid[0:stamp.shape[0], 0:stamp.shape[1]]
+    y, x = np.mgrid[0 : stamp.shape[0], 0 : stamp.shape[1]]
 
     # Corresponding image pixels
-    y1,x1 = np.mgrid[0:stamp.shape[0], 0:stamp.shape[1]]
-    x1 += int(np.round(x0) - np.floor(stamp.shape[1]/2))
-    y1 += int(np.round(y0) - np.floor(stamp.shape[0]/2))
+    y1, x1 = np.mgrid[0 : stamp.shape[0], 0 : stamp.shape[1]]
+    x1 += int(np.round(x0) - np.floor(stamp.shape[1] / 2))
+    y1 += int(np.round(y0) - np.floor(stamp.shape[0] / 2))
 
     # Crop the coordinates outside target image
     idx = np.isfinite(stamp)

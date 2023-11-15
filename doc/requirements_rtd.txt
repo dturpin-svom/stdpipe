@@ -19,3 +19,6 @@ statsmodels
 tqdm
 psycopg2
 regions
+sip_tpv
+astroscrappy
+pyfftw
